@@ -1,5 +1,7 @@
 package iie.SparkStreaming;
 
+import iie.udps.api.streaming.DStreamWithSchema;
+
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
@@ -31,6 +33,8 @@ import org.dom4j.Element;
 import org.dom4j.io.SAXReader;
 
 public class OpContainerTest {
+	static HashMap<String, DStreamWithSchema> RESULT_MAP = new HashMap<String, DStreamWithSchema>();
+
 	public static void main(String[] args) throws Exception {
 
 		/*
@@ -56,25 +60,23 @@ public class OpContainerTest {
 		// 拓扑排序
 		List<OpNode> topologicalOrder = topologicalOrder(opGraphMap);
 
-		Map<String, String> resulMap = new HashMap<String, String>();
 
 		// 反射机制拓扑顺序执行算子
-		executeOperator(topologicalOrder);
+		executeOperator("ssc",topologicalOrder);
 
 		ctx.stop();
 	}
 
-	public static void executeOperator(List<OpNode> topologicalOrder) {
-		HashMap<String, String> resultMap = new HashMap<String, String>();
+	public static void executeOperator(String ssc,List<OpNode> topologicalOrder) {
+		HashMap<String, DStreamWithSchema> resultMap = new HashMap<String, DStreamWithSchema>();
 		for (OpNode operator : topologicalOrder) {
 
 			// 获取算子jar包和主类名
 			String className = operator.getOpMainClassName();
 
-			String ssc = "";
 			String arguments = operator.getArgsXML();
 			List<String> inputPort = operator.getInputPortList();
-			Map<String, String> inputDStreamMap = new HashMap<String, String>();
+			HashMap<String, DStreamWithSchema> inputDStreamMap = new HashMap<String, DStreamWithSchema>();
 			for (String port : inputPort) {
 				inputDStreamMap.put(port, resultMap.get(port));
 			}
@@ -87,12 +89,12 @@ public class OpContainerTest {
 						inputDStreamMap.getClass() };
 				Object[] argsArr = { ssc, arguments, inputDStreamMap };
 				Method method = ownerClass.getMethod("execute", argsClass);
-				HashMap<String, String> opOutputs = new HashMap<String, String>();
-				opOutputs = (HashMap<String, String>) method.invoke(
+				HashMap<String, DStreamWithSchema> opOutputs = new HashMap<String, DStreamWithSchema>();
+				opOutputs = (HashMap<String, DStreamWithSchema>) method.invoke(
 						ownerClass.newInstance(), argsArr);
 				for (Entry outputi : opOutputs.entrySet()) {
-					resultMap.put((String) outputi.getKey(),
-							(String) outputi.getValue());
+					RESULT_MAP.put((String) outputi.getKey(),
+							(DStreamWithSchema) outputi.getValue());
 				}
 			} catch (ClassNotFoundException | NoSuchMethodException
 					| SecurityException | IllegalAccessException
@@ -104,6 +106,22 @@ public class OpContainerTest {
 	}
 
 	public static HashMap<String, String> initMainClassMap(
+			HashMap<String, String> opClassNameMap,Document document) {
+		HashMap<String, String> mainClassMap = new HashMap<String, String>();
+			
+		
+		List<Element> operatorElem = document.selectNodes("/operator/operator");
+		for (Element elem : operatorElem) {
+			if (opClassNameMap.containsKey(elem.attributeValue("name"))) {
+				mainClassMap.put(elem.attributeValue("name"),
+						elem.attributeValue("mainClass"));
+			}
+		}
+		
+		return mainClassMap;
+	}
+	
+	public static HashMap<String, String> initMainClassMap_ByMySQL(
 			HashMap<String, String> opClassNameMap) {
 		HashMap<String, String> mainClassMap = new HashMap<String, String>();
 		try {
@@ -197,7 +215,7 @@ public class OpContainerTest {
 		HashMap<String, String> opClassNameMap = initClassNameMap(opNameSet,
 				document);
 		// 初始化算子的MainClassName
-		HashMap<String, String> opMainClassMap = initMainClassMap(opClassNameMap);
+		HashMap<String, String> opMainClassMap = initMainClassMap(opClassNameMap,document);
 
 		// 初始化算子流程图，使用hashmap存储，kv对为<算子名，算子实例>
 		HashMap<String, OpNode> opGraphMap = new HashMap<String, OpNode>();

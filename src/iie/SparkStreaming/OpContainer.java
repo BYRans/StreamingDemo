@@ -1,5 +1,7 @@
 package iie.SparkStreaming;
 
+import iie.udps.api.streaming.DStreamWithSchema;
+
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
@@ -20,22 +22,22 @@ import java.util.Queue;
 import java.util.Map.Entry;
 
 import org.apache.spark.SparkConf;
-import org.apache.spark.api.java.JavaSparkContext;
-import org.apache.spark.streaming.Duration;
+import org.apache.spark.streaming.Durations;
 import org.apache.spark.streaming.api.java.JavaStreamingContext;
-import org.dom4j.Attribute;
 import org.dom4j.Document;
 import org.dom4j.DocumentException;
-import org.dom4j.DocumentHelper;
 import org.dom4j.Element;
 import org.dom4j.io.SAXReader;
 
 public class OpContainer {
+	static Map<String, DStreamWithSchema> RESULT_MAP = new HashMap<String, DStreamWithSchema>();
+
 	public static void main(String[] args) throws Exception {
 
-		JavaStreamingContext jssc = new JavaStreamingContext(
-				new SparkConf().setAppName("SparkStreamingOperator"),
-				new Duration(10000));
+		SparkConf sparkConf = new SparkConf()
+				.setAppName("SparkSQL test by kafka");
+		JavaStreamingContext jssc = new JavaStreamingContext(sparkConf,
+				Durations.seconds(5));
 		/*
 		 * spark-submit --class iie.SparkStreaming.OpContainer --master local
 		 * /home/dingyu/test.jar --driver-class-path
@@ -43,14 +45,12 @@ public class OpContainer {
 		 * -java-5.1.37/mysql-connector-java-5.1.37-bin.jar
 		 */
 
-		String xmlPath = "/home/dingyu/xml/procedureDefinition.xml";
+		String xmlPath = "/home/dingyu/xml/procedureDefinitionTest.xml";
 		// 解析算子连接关系图，使用map存储
 		HashMap<String, OpNode> opGraphMap = parsingOpFlow(xmlPath);
 
 		// 拓扑排序
 		List<OpNode> topologicalOrder = topologicalOrder(opGraphMap);
-
-		Map<String, String> resulMap = new HashMap<String, String>();
 
 		// 反射机制拓扑顺序执行算子
 		executeOperator(topologicalOrder, jssc);
@@ -61,7 +61,6 @@ public class OpContainer {
 
 	public static void executeOperator(List<OpNode> topologicalOrder,
 			JavaStreamingContext jssc) {
-		HashMap<String, String> resultMap = new HashMap<String, String>();
 		for (OpNode operator : topologicalOrder) {
 
 			// 获取算子jar包和主类名
@@ -70,9 +69,9 @@ public class OpContainer {
 			String ssc = "";// 这里修改为jssc!!!!!!!!!!
 			String arguments = operator.getArgsXML();
 			List<String> inputPort = operator.getInputPortList();
-			Map<String, String> inputDStreamMap = new HashMap<String, String>();
+			Map<String, DStreamWithSchema> inputDStreamMap = new HashMap<String, DStreamWithSchema>();
 			for (String port : inputPort) {
-				inputDStreamMap.put(port, resultMap.get(port));
+				inputDStreamMap.put(port, RESULT_MAP.get(port));
 			}
 
 			// 反射机制
@@ -83,12 +82,12 @@ public class OpContainer {
 						inputDStreamMap.getClass() };
 				Object[] argsArr = { ssc, arguments, inputDStreamMap };
 				Method method = ownerClass.getMethod("execute", argsClass);
-				HashMap<String, String> opOutputs = new HashMap<String, String>();
-				opOutputs = (HashMap<String, String>) method.invoke(
+				Map<String, String> opOutputs = new HashMap<String, String>();
+				opOutputs = (Map<String, String>) method.invoke(
 						ownerClass.newInstance(), argsArr);
 				for (Entry outputi : opOutputs.entrySet()) {
-					resultMap.put((String) outputi.getKey(),
-							(String) outputi.getValue());
+					RESULT_MAP.put(operator.getOperatorName()+"."+(String) outputi.getKey(),
+							(DStreamWithSchema) outputi.getValue());
 				}
 			} catch (ClassNotFoundException | NoSuchMethodException
 					| SecurityException | IllegalAccessException
