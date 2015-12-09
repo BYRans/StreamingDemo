@@ -3,121 +3,194 @@ package iie.SparkStreaming;
 import iie.udps.api.streaming.DStreamWithSchema;
 
 import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.sql.ResultSet;
-import java.sql.SQLException;
+import java.net.MalformedURLException;
+import java.net.URI;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
-import java.util.Queue;
 import java.util.Map.Entry;
+import java.util.Queue;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.util.Progressable;
 import org.apache.spark.SparkConf;
+import org.apache.spark.streaming.Duration;
 import org.apache.spark.streaming.Durations;
 import org.apache.spark.streaming.api.java.JavaStreamingContext;
+import org.dom4j.Attribute;
 import org.dom4j.Document;
 import org.dom4j.DocumentException;
+import org.dom4j.DocumentHelper;
 import org.dom4j.Element;
+import org.dom4j.io.OutputFormat;
 import org.dom4j.io.SAXReader;
+import org.dom4j.io.XMLWriter;
 
 public class OpContainer {
 	static Map<String, DStreamWithSchema> RESULT_MAP = new HashMap<String, DStreamWithSchema>();
+	static String START_LOG = "";
 
 	public static void main(String[] args) throws Exception {
-
-		SparkConf sparkConf = new SparkConf()
-				.setAppName("SparkSQL test by kafka");
-		JavaStreamingContext jssc = new JavaStreamingContext(sparkConf,
-				Durations.seconds(5));
-		/*
-		 * spark-submit --class iie.SparkStreaming.OpContainer --master local
-		 * /home/dingyu/test.jar --driver-class-path
-		 * /home/dingyu/mysql-connector
-		 * -java-5.1.37/mysql-connector-java-5.1.37-bin.jar
-		 */
+		JavaStreamingContext jssc = new JavaStreamingContext(
+				new SparkConf().setAppName("SparkStreamingOperatorTest"),
+				new Duration(10000));
 
 		String xmlPath = "/home/dingyu/xml/procedureDefinitionTest.xml";
-		// ½âÎöËã×ÓÁ¬½Ó¹ØÏµÍ¼£¬Ê¹ÓÃmap´æ´¢
+		if (args.length > 1)
+			xmlPath = args[1];
+
+		// è§£æç®—å­è¿æ¥å…³ç³»å›¾ï¼Œä½¿ç”¨HashMapå­˜å‚¨å›¾ç»“æ„
 		HashMap<String, OpNode> opGraphMap = parsingOpFlow(xmlPath);
 
-		// ÍØÆËÅÅĞò
+		// æ‹“æ‰‘æ’åº
+
 		List<OpNode> topologicalOrder = topologicalOrder(opGraphMap);
 
-		// ·´Éä»úÖÆÍØÆËË³ĞòÖ´ĞĞËã×Ó
-		executeOperator(topologicalOrder, jssc);
+		// åå°„æœºåˆ¶æ‹“æ‰‘é¡ºåºæ‰§è¡Œç®—å­
+		executeOperator(jssc, topologicalOrder);
+
+		writeStartupLog(START_LOG, xmlPath);
 
 		jssc.start();
 		jssc.awaitTermination();
 	}
 
-	public static void executeOperator(List<OpNode> topologicalOrder,
-			JavaStreamingContext jssc) {
+	public static void writeStartupLog(String log, String xmlPath) {
+		Document document = readXMLFromHDFS(xmlPath);
+		Element rootNode = document.getRootElement();
+		String jobInstanceId = rootNode.element("jobinstanceid").getTextTrim();
+		List<Element> propertys = document
+				.selectNodes("/requestParams/operator/context/property");
+		String tempHDFSPathValue = "";
+		for (Element property : propertys) {
+			if ("tempHdfsBasePath".equals(property.attributeValue("name"))) {
+				tempHDFSPathValue = property.attributeValue("value");
+				if (!"/".equals(tempHDFSPathValue.charAt(tempHDFSPathValue
+						.length() - 1))) {
+					tempHDFSPathValue += "/";
+				}
+			}
+		}
+		Map<String, String> testMap = new HashMap<String, String>();
+		testMap.put("startLog", log);
+		writeToHDFSFile(tempHDFSPathValue+"startLog-"+jobInstanceId+".xml", testMap);
+	}
+
+	public static void executeOperator(JavaStreamingContext jssc,
+			List<OpNode> topologicalOrder) throws MalformedURLException {
+		String outputMessage = "";
 		for (OpNode operator : topologicalOrder) {
 
-			// »ñÈ¡Ëã×Ójar°üºÍÖ÷ÀàÃû
-			String className = operator.getOpMainClassName();
+			System.out.println("**************************\n running "
+					+ operator.getOpMainClassName());
 
-			String ssc = "";// ÕâÀïĞŞ¸ÄÎªjssc!!!!!!!!!!
 			String arguments = operator.getArgsXML();
 			List<String> inputPort = operator.getInputPortList();
-			Map<String, DStreamWithSchema> inputDStreamMap = new HashMap<String, DStreamWithSchema>();
+			HashMap<String, DStreamWithSchema> inputDStreamMap = new HashMap<String, DStreamWithSchema>();
 			for (String port : inputPort) {
 				inputDStreamMap.put(port, RESULT_MAP.get(port));
 			}
 
-			// ·´Éä»úÖÆ
+			// åå°„æœºåˆ¶
 			try {
-				Class ownerClass = Class.forName("iie.SparkStreaming."
-						+ className);
-				Class[] argsClass = { ssc.getClass(), arguments.getClass(),
-						inputDStreamMap.getClass() };
-				Object[] argsArr = { ssc, arguments, inputDStreamMap };
-				Method method = ownerClass.getMethod("execute", argsClass);
-				Map<String, String> opOutputs = new HashMap<String, String>();
-				opOutputs = (Map<String, String>) method.invoke(
-						ownerClass.newInstance(), argsArr);
-				for (Entry outputi : opOutputs.entrySet()) {
-					RESULT_MAP.put(operator.getOperatorName()+"."+(String) outputi.getKey(),
-							(DStreamWithSchema) outputi.getValue());
+				Class<?> ownerClass = Class.forName(operator
+						.getOpMainClassName());
+				Class[] argsClass = { JavaStreamingContext.class, String.class,
+						HashMap.class };
+				Object[] argsArr = { jssc, arguments, inputDStreamMap };
+				Method method = ownerClass.getDeclaredMethod("execute",
+						argsClass);
+				HashMap<String, DStreamWithSchema> opOutputs = new HashMap<String, DStreamWithSchema>();
+
+				System.out.println(operator.getOpClassName()
+						+ " argsXML  >>>>>>>>>>>>>>>>>>>\n"
+						+ operator.getArgsXML());
+
+				System.out.print(operator.getOpClassName()
+						+ " record >>>>>>> size:" + inputDStreamMap.size()
+						+ "record list:\n");
+				for (Entry<String, DStreamWithSchema> kv : inputDStreamMap
+						.entrySet()) {
+					System.out.println(">>:" + kv.getKey());
 				}
+				opOutputs = (HashMap<String, DStreamWithSchema>) method.invoke(
+						ownerClass.newInstance(), argsArr);
+				if (opOutputs != null) {
+					for (Entry outputi : opOutputs.entrySet()) {
+						RESULT_MAP.put((String) outputi.getKey(),
+								(DStreamWithSchema) outputi.getValue());
+					}
+				}
+
+				START_LOG += operator.getOperatorName() + " run success.\n";
 			} catch (ClassNotFoundException | NoSuchMethodException
 					| SecurityException | IllegalAccessException
 					| IllegalArgumentException | InvocationTargetException
 					| InstantiationException e) {
 				e.printStackTrace();
+				START_LOG += operator.getOperatorName() + " run failed.\n";
+				break;
+			} finally {
+				System.out.println(outputMessage);
 			}
 		}
 	}
 
-	public static HashMap<String, String> initMainClassMap(
-			HashMap<String, String> opClassNameMap) {
-		HashMap<String, String> mainClassMap = new HashMap<String, String>();
+	public static void writeToHDFSFile(String fileName,
+			Map<String, String> listOut) {
+
+		String startLog = null;
+		startLog = listOut.get("startLog").toString();
+
+		Document document = DocumentHelper.createDocument();
+		Element response = document.addElement("log");
+		Element startLogNode = response.addElement("startLog");
+		startLogNode.setText(startLog);
+
 		try {
-			for (Entry kv : opClassNameMap.entrySet()) {
-				String sql = "select mainClass from operatorInfo where operatorName = '"
-						+ kv.getValue() + "'";// SQLÓï¾ä
-				DBHelper db = new DBHelper(sql);// ´´½¨DBHelper¶ÔÏó
-				ResultSet ret = db.pst.executeQuery();// Ö´ĞĞÓï¾ä£¬µÃµ½½á¹û¼¯
-				while (ret.next()) {
-					mainClassMap.put(kv.getKey() + "", ret.getString(1));
-				}// ÏÔÊ¾Êı¾İ
-				if (mainClassMap.size() <= 0)
-					System.out.println("wrong operator Class name of "
-							+ kv.getValue() + " in args xml");
-				db.close();// ¹Ø±ÕÁ¬½Ó
-			}
-		} catch (SQLException e) {
-			e.printStackTrace();
+			Configuration conf = new Configuration();
+			FileSystem fs = FileSystem.get(URI.create(fileName), conf);
+			OutputStream out = fs.create(new Path(fileName),
+					new Progressable() {
+						public void progress() {
+						}
+					});
+			OutputFormat format = OutputFormat.createPrettyPrint();
+			format.setEncoding("UTF-8");
+			XMLWriter xmlWriter = new XMLWriter(out, format);
+			xmlWriter.write(document);
+			xmlWriter.close();
+		} catch (IOException e) {
+			System.out.println(e.getMessage());
 		}
+	}
+
+	public static HashMap<String, String> initMainClassMap(
+			HashMap<String, String> opClassNameMap, Document document) {
+		HashMap<String, String> mainClassMap = new HashMap<String, String>();
+
+		List<Element> operatorElem = document
+				.selectNodes("/requestParams/operator/operator");
+		for (Element elem : operatorElem) {
+			if (opClassNameMap.containsKey(elem.attributeValue("name"))) {
+				mainClassMap.put(elem.attributeValue("name"),
+						elem.attributeValue("mainClass"));
+			}
+		}
+
 		return mainClassMap;
 	}
 
@@ -149,52 +222,99 @@ public class OpContainer {
 		return topologicalOrder;
 	}
 
-	/** ½âÎö¹ı³Ì¶¨ÒåÎÄ¼ş£¬·µ»ØÓÃmap´æ´¢µÄÍ¼½á¹¹ ¡£kv¶ÔÎª£º<Ëã×ÓÃû£¬Ëã×ÓĞÅÏ¢½Úµã> */
-	public static HashMap<String, OpNode> parsingOpFlow(String argsPath) {
-		File file = new File(argsPath);
+	/** è§£æè¿‡ç¨‹å®šä¹‰ï¼Œè¿”å›ç”¨mapå­˜å‚¨çš„å›¾ç»“æ„ã€‚kvå¯¹ä¸ºï¼š<ç®—å­åï¼Œç®—å­ä¿¡æ¯èŠ‚ç‚¹> */
+	public static HashMap<String, OpNode> parsingOpFlow(String hdfsPath) {
+		// File file = new File(argsPath);
 		HashMap<String, OpNode> opGraphMap = new HashMap<String, OpNode>();
-		// ´´½¨saxReader¶ÔÏó
-		SAXReader reader = new SAXReader();
-		// Í¨¹ıread·½·¨¶ÁÈ¡Ò»¸öÎÄ¼ş ×ª»»³ÉDocument¶ÔÏó
-		Document document;
-		try {
-			document = reader.read(file);
-			// Éú³ÉËã×Ó¹ØÏµÍ¼£¬³õÊ¼»¯opName/inDegree/childrenNameList/inputPortList/opClassName
-			opGraphMap = generateOpGraph(document);
-		} catch (DocumentException e) {
-			e.printStackTrace();
-		}
+		Document document = readXMLFromHDFS(hdfsPath);
+		// ç”Ÿæˆç®—å­å…³ç³»å›¾ï¼Œåˆå§‹åŒ–ç®—å­çš„opName/inDegree/childrenNameList/inputPortList/opClassName
+		opGraphMap = generateOpGraph(document);
 		return opGraphMap;
 	}
 
+	/** è§£æè¿‡ç¨‹å®šä¹‰ï¼Œè¿”å›ç”¨mapå­˜å‚¨çš„å›¾ç»“æ„ã€‚kvå¯¹ä¸ºï¼š<ç®—å­åï¼Œç®—å­ä¿¡æ¯èŠ‚ç‚¹> */
+	public static Document readXMLFromHDFS(String hdfsPath) {
+		HashMap<String, OpNode> opGraphMap = new HashMap<String, OpNode>();
+		// åˆ›å»ºsaxReaderå¯¹è±¡
+		SAXReader reader = new SAXReader();
+		FileSystem fileSystem = null;
+		try {
+			fileSystem = FileSystem.get(new Configuration());
+		} catch (IOException e1) {
+			// TODO Auto-generated catch block
+			e1.printStackTrace();
+		}
+		Path hdfspath = new Path(hdfsPath);
+		FSDataInputStream fsin = null;
+		try {
+			fsin = fileSystem.open(hdfspath);
+		} catch (IOException e1) {
+			// TODO Auto-generated catch block
+			e1.printStackTrace();
+		}
+		Document document = null;
+		try {
+			document = reader.read(new InputStreamReader(fsin));
+		} catch (DocumentException e) {
+			e.printStackTrace();
+		}
+		return document;
+	}
+
+	/**
+	 * è·å¾—hdfsæ–‡ä»¶å†…å®¹ä¿¡æ¯
+	 * 
+	 * @param hdfsPath
+	 *            æ–‡ä»¶hdfsè·¯å¾„
+	 * @return è¿”å›Stringæ ¼å¼ä¿¡æ¯
+	 * @throws Exception
+	 */
+	public static String getStringFromHdfs(String hdfsPath) throws Exception {
+		FileSystem fileSystem = FileSystem.get(new Configuration());
+		Path hdfspath = new Path(hdfsPath);
+		FSDataInputStream fsin = fileSystem.open(hdfspath);
+		BufferedReader reader = new BufferedReader(new InputStreamReader(fsin));
+		String data = "";
+		String dataTemp = "";
+		while ((dataTemp = reader.readLine()) != null) {
+			data += "\n" + dataTemp;
+		}
+		data = data.substring(1);
+		reader.close();
+		fsin.close();
+		return data;
+	}
+
 	public static HashMap<String, OpNode> generateOpGraph(Document document) {
-		// »ñÈ¡ËùÓĞconnect½ÚµãĞÅÏ¢
-		List<Element> connectElem = document.selectNodes("/operator/connect");
-		// ±éÀú¹ı³Ì¶¨ÒåxmlÖĞµÄconnect±êÇ©ÄÚÈİ£¬¹ıÂËµô¶Ë¿ÚĞÅÏ¢£¬Ö»±£ÁôËã×ÓÃûĞÅÏ¢µÄÁ¬½Ó¹ØÏµ
+		// è·å–æ‰€æœ‰connectèŠ‚ç‚¹ä¿¡æ¯
+		List<Element> connectElem = document
+				.selectNodes("/requestParams/operator/connect");
+		// ä¾¿åˆ©è¿‡ç¨‹å®šä¹‰xmlä¸­çš„connectæ ‡ç­¾å†…å®¹ï¼Œè¿‡æ»¤æ‰ç«¯å£ä¿¡æ¯ï¼Œè‡ªä¿ç•™ç®—å­åä¿¡æ¯çš„è¿æ¥å…³ç³»
 		HashSet<String> connectSet = filterConnectSet(connectElem);
 
-		// »ñÈ¡Ëã×ÓÃû¼¯ºÏ
+		// è·å–ç®—å­åé›†åˆ
 		HashSet<String> opNameSet = filterOpNameSet(connectSet);
 
-		// ³õÊ¼»¯Ã¿¸öËã×ÓµÄº¢×ÓÁĞ±í
+		// åˆå§‹åŒ–æ¯ä¸ªç®—å­çš„å­©å­åˆ—è¡¨
 		HashMap<String, List<String>> opNameChildMap = initChildMap(opNameSet,
 				connectSet);
-		// ³õÊ¼»¯Ã¿¸öËã×ÓµÄÈë¶È
+		// åˆå§‹åŒ–æ¯ä¸ªç®—å­çš„å…¥åº¦
 		HashMap<String, Integer> opNameIndegreeMap = initIndegreeMap(opNameSet,
 				connectSet);
-		// ³õÊ¼»¯Ëã×ÓµÄinputPortList
+		// åˆå§‹åŒ–ç®—å­çš„inputPortList
 		HashMap<String, List<String>> opNameInputMap = initIputPortMap(
 				opNameSet, connectElem);
-		// ³õÊ¼»¯Ëã×ÓµÄxml²ÎÊı
+		// åˆå§‹åŒ–ç®—å­çš„xmlå‚æ•°
 		HashMap<String, String> opArgsMap = initArgsMap(opNameSet, document);
 
-		// ³õÊ¼»¯Ëã×ÓµÄClassName
+		// åˆå§‹åŒ–ç®—å­çš„ClassName
 		HashMap<String, String> opClassNameMap = initClassNameMap(opNameSet,
 				document);
-		// ³õÊ¼»¯Ëã×ÓµÄMainClassName
-		HashMap<String, String> opMainClassMap = initMainClassMap(opClassNameMap);
+		// åˆå§‹åŒ–ç®—å­çš„MainClassName
+		HashMap<String, String> opMainClassMap = initMainClassMap(
+				opClassNameMap, document);
 
-		// ³õÊ¼»¯Ëã×ÓÁ÷³ÌÍ¼£¬Ê¹ÓÃhashmap´æ´¢£¬kv¶ÔÎª<Ëã×ÓÃû£¬Ëã×ÓÊµÀı>
+		// åˆå§‹åŒ–ç®—å­æµç¨‹å›¾hashmapå­˜å‚¨ï¼Œkvå¯¹ä¸º<ç®—å­åï¼Œç®—å­å®ä¾‹>
 		HashMap<String, OpNode> opGraphMap = new HashMap<String, OpNode>();
 		for (String opName : opNameSet) {
 			OpNode opNode = new OpNode();
@@ -213,7 +333,8 @@ public class OpContainer {
 	public static HashMap<String, String> initClassNameMap(HashSet opNameSet,
 			Document document) {
 		HashMap<String, String> opClassNameMap = new HashMap<String, String>();
-		List<Element> operatorElem = document.selectNodes("/operator/operator");
+		List<Element> operatorElem = document
+				.selectNodes("/requestParams/operator/operator");
 		for (Element elem : operatorElem) {
 			if (opNameSet.contains(elem.attributeValue("name"))) {
 				opClassNameMap.put(elem.attributeValue("name"),
@@ -234,7 +355,7 @@ public class OpContainer {
 
 	public static HashSet<String> filterConnectSet(List<Element> connectElem) {
 		HashSet<String> connectSet = new HashSet<String>();
-		// ±éÀú¹ı³Ì¶¨ÒåxmlÖĞµÄconnect±êÇ©ÄÚÈİ£¬¹ıÂËµô¶Ë¿ÚĞÅÏ¢£¬Ö»±£ÁôËã×ÓÃûĞÅÏ¢
+		// ä¾¿åˆ©è¿‡ç¨‹å®šä¹‰xmlä¸­çš„connectæ ‡ç­¾å†…å®¹ï¼Œè¿‡æ»¤æ‰ç«¯å£ä¿¡æ¯ï¼Œåªä¿ç•™ç®—å­åä¿¡æ¯
 		for (Element node : connectElem) {
 			connectSet.add(node.attributeValue("from").split("\\.")[0] + ">"
 					+ node.attributeValue("to").split("\\.")[0]);
@@ -245,14 +366,60 @@ public class OpContainer {
 	public static HashMap<String, String> initArgsMap(
 			HashSet<String> opNameSet, Document document) {
 		HashMap<String, String> opArgsMap = new HashMap<String, String>();
-		// »ñÈ¡¸ù½ÚµãÔªËØ¶ÔÏó
+		// è·å–æ ¹èŠ‚ç‚¹å…ƒç´ å¯¹è±¡
 		Element rootNode = document.getRootElement();
-		// »ñÈ¡context½ÚµãËùÓĞÎÄ×ÖÄÚÈİ
-		String context = rootNode.element("context").asXML();
-		List<Element> operators = document.selectNodes("/operator/operator");
+		Element containOp = document.getRootElement().element("operator");
+		List<Element> propertys = document
+				.selectNodes("/requestParams/operator/context/property");
+		Attribute tempPathValue = null;
+		String oldTempPath = "";
+		for (Element property : propertys) {
+			if ("tempHdfsBasePath".equals(property.attributeValue("name"))) {
+				oldTempPath = property.attributeValue("value");
+				if (!"/".equals(oldTempPath.charAt(oldTempPath.length() - 1))) {
+					oldTempPath += "/";
+				}
+				tempPathValue = property.attribute("value");
+			}
+		}
+		if ("".equals(oldTempPath) || tempPathValue == null) {
+			System.out
+					.println("The args lack of tempHdfsBasePath in <context> tag.");
+		}
+		Element context = containOp.element("context");
+		Element jobinstanceid = rootNode.element("jobinstanceid");
+		List<Element> operators = document
+				.selectNodes("/requestParams/operator/operator");
+		List<Element> connects = document
+				.selectNodes("/requestParams/operator/connect");
+		HashMap<String, String> connectPairs = new HashMap<String, String>();
+		for (Element connect : connects) {
+			connectPairs.put(connect.attributeValue("to"),
+					connect.attributeValue("from"));
+		}
 		for (Element elem : operators) {
+			tempPathValue.setValue(oldTempPath + elem.attributeValue("name"));
+			String tmpDatasets = "";
+			for (Entry<String, String> toFromKV : connectPairs.entrySet()) {
+				if (toFromKV.getKey().toString().split("\\.")[0].equals(elem
+						.attributeValue("name"))) {
+
+					tmpDatasets += "\t\t<dataset name=\""
+							+ toFromKV.getKey().split("\\.")[1]
+							+ "\">\n\t\t\t<row>"
+							+ toFromKV.getValue().toString()
+							+ "</row>\n\t\t</dataset>\n";
+				}
+			}
+			tmpDatasets = "\n\t<datasets>\n" + tmpDatasets + "\t</datasets>";
+
 			String opArg = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<request>\n\t"
-					+ context + "\n\t" + elem.asXML() + "\n</request>";
+					+ jobinstanceid.asXML()
+					+ "\n\t"
+					+ context.asXML()
+					+ "\n\t"
+					+ elem.asXML() + tmpDatasets + "\n</request>";
+
 			if (opNameSet.contains(elem.attributeValue("name")))
 				opArgsMap.put(elem.attributeValue("name"), opArg);
 		}
@@ -262,10 +429,10 @@ public class OpContainer {
 	public static HashMap<String, Integer> initIndegreeMap(
 			HashSet<String> opNameSet, HashSet<String> connectSet) {
 		HashMap<String, Integer> opNameIndegreeMap = new HashMap<String, Integer>();
-		for (String opName : opNameSet) {// ±éÀúËã×ÓÃû¼¯ºÏ£¬¹¹½¨ËùÓĞËã×ÓµÄ name-childNameList¶Ô
-			opNameIndegreeMap.put(opName, 0);// Ã¿¸ö½ÚµãµÄÈë¶È£¬½«ÔÚÉèÖÃÈë¶ÈÊ±ÓÃµ½
+		for (String opName : opNameSet) {// ï¿½éå†ç®—å­åé›†åˆï¼Œæ„å»ºç®—æœ‰ç®—å­çš„name-childNameListå¯¹
+			opNameIndegreeMap.put(opName, 0);// æ¯ä¸ªèŠ‚ç‚¹çš„å…¥åº¦ï¼Œå°†åœ¨è®¾ç½®å…¥åº¦æ—¶ç”¨åˆ°
 		}
-		// ³õÊ¼»¯Ã¿¸ö½ÚµãµÄÈë¶È
+		// ç”Ÿæˆå­©å­åˆ—è¡¨
 		for (String connect : connectSet) {
 			opNameIndegreeMap.put(connect.split(">")[1],
 					opNameIndegreeMap.get(connect.split(">")[1]) + 1);
@@ -277,11 +444,10 @@ public class OpContainer {
 			HashSet<String> opNameSet, HashSet<String> connectSet) {
 		HashMap<String, List<String>> opNameChildMap = new HashMap<String, List<String>>();
 		HashMap<String, Integer> opNameIndegreeMap = new HashMap<String, Integer>();
-		for (String opName : opNameSet) {// ±éÀúËã×ÓÃû¼¯ºÏ£¬¹¹½¨ËùÓĞËã×ÓµÄ name-childNameList¶Ô
-			opNameIndegreeMap.put(opName, 0);// Ã¿¸ö½ÚµãµÄÈë¶È£¬½«ÔÚÉèÖÃÈë¶ÈÊ±ÓÃµ½
+		for (String opName : opNameSet) {
+			opNameIndegreeMap.put(opName, 0);
 			opNameChildMap.put(opName, new ArrayList<String>());
 			for (String connect : connectSet) {
-				// Éú³Éº¢×ÓÁĞ±í
 				if (opName.equals(connect.split(">")[0])) {
 					opNameChildMap.get(opName).add(connect.split(">")[1]);
 				}
@@ -293,7 +459,8 @@ public class OpContainer {
 	public static HashMap<String, List<String>> initIputPortMap(
 			HashSet<String> opNameSet, List<Element> connectElem) {
 		HashMap<String, List<String>> opNameInputMap = new HashMap<String, List<String>>();
-		for (String opName : opNameSet) {// ±éÀúËã×ÓÃû¼¯ºÏ£¬¹¹½¨ËùÓĞËã×ÓµÄ name-childNameList¶Ô
+		for (String opName : opNameSet) {// ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Óµï¿½
+											// name-childNameListï¿½ï¿½
 			opNameInputMap.put(opName, new ArrayList<String>());
 			for (Element node : connectElem) {
 				if (opName.equals(node.attributeValue("to").split("\\.")[0])) {
